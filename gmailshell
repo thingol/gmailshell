@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 __author__  = 'Marius Hårstad Bauer-Kjerkreit'
-__program__ = 'GMailShell'
+__program__ = 'GmailShell'
 __version__ = '0.0.0a0'
 
 import cmd
 import httplib2
 
+from time import sleep
 
 class GmailConnection:
     __client_id = None
@@ -18,7 +19,7 @@ class GmailConnection:
         self._load_config()
         self._connect()
 
-    def _connection(self):
+    def _connect(self):
         import os
         from apiclient import discovery
         from argparse import ArgumentParser
@@ -36,13 +37,13 @@ class GmailConnection:
                 OAuth2WebServerFlow(
                     client_id=self.__client_id,
                     client_secret=self.__client_sec,
-                    scope=['https://www.googleapis.com/auth/gmail'],
+                    scope=['https://www.googleapis.com/auth/gmail.modify'],
                     user_agent=__program__ + '/' + __version__),
                 store, flags)
             print('Storing credentials: ' + credential_path)
         http = credentials.authorize(httplib2.Http())
 
-        self.__conn = discovery.build('', 'v3', http=http)
+        self.__conn = discovery.build('gmail', 'v1', http=http)
 
     def _load_config(self):
         import sys
@@ -63,11 +64,158 @@ class GmailConnection:
             cfg.read(cfg_file)
             self.__client_id = cfg['auth']['client_id']
             self.__client_sec = cfg['auth']['client_sec']
-    
 
-class GMailShell(cmd.Cmd):
-    intro = Fore.RESET + '\nWelcome to GMailShell. Type "help" for help.\n'
-    prompt = 'GMail> '
+    def list_attachments(self, id):
+        res = self.__conn.users().messages().get(userId='me',id=id).execute()['payload']['parts']
+        atts = filter(lambda x: 'attachmentId'in x['body'], res)
+        return map(lambda x: {'filename':x['filename'],'aId':x['body']['attachmentId']}, atts)
+
+    def list_labels(self):
+        return self.__conn.users().labels().list(userId='me').execute().get('labels', [])
+
+    def list_messages(self,label=None):
+        parms = {'userId':'me'}#,
+                 #'maxResults':2}
+
+        if (label != ''):
+            parms['labelIds'] = label
+
+        return self.__conn.users().messages().list(**parms).execute().get('messages', [])
+
+    def download_comics(self,label):
+        from time import sleep
+
+        aId_list = self._generate_attachmentId_list(label)
+        atts = self.__conn.users().messages().attachments()
+
+        def move_to_ctrash(mId):
+            parms = {'removeLabelIds':['Label_52','Label_51'],
+                     'addLabelIds':['Label_75']}
+
+            #print('mId: {0}'.format(mId))
+
+            self.__conn.users().messages().modify(userId='me', id=mId, body=parms).execute()
+
+        def save_attachments(msg):
+            from base64 import urlsafe_b64decode
+            from time import sleep
+
+            att_resource = self.__conn.users().messages().attachments()
+            mId = msg[0]
+            #print(msg)
+
+            #print('saving files: ', end='')
+            for entry in msg[1].items():
+                # print('userId=\'me\', messageId={0}, id={1}'.format(msg[0], entry[0]))
+                sleep(0.5)
+                data = att_resource.get(userId='me', messageId=mId, id=entry[0]).execute()['data']
+                data = urlsafe_b64decode(data.encode('UTF-8'))
+                print('.', end='')
+                with open(entry[1], 'wb') as f:
+                    f.write(data)
+
+            #print('done')
+
+        # {mId:{aId:fname}}
+        #print('aId_list: '.format(aId_list))
+        #print('downloading...', end='')
+        for msg in aId_list.items():
+            #for atts in aId_list[msg[0]].items():
+            save_attachments(msg)
+            move_to_ctrash(msg[0])
+            #print('poke')
+
+        print('done')
+
+    def _generate_attachmentId_list(self, label):
+        from time import sleep
+        # label = 'Label_52' # 51
+        parms = {'userId':'me',
+                 'labelIds':label,
+                 'maxResults':1}
+        req = True
+        msgs_list = []
+        req_cnt = 0
+
+
+        def get_attachmentIds(msgs):
+            retval = {}
+            att_cnt = 0
+            unwanted = False
+            for msg in msgs:
+                sleep(0.2)
+                mid = msg['id']
+                #print(mid)
+                atts = {}
+                msg_res = self.__conn.users().messages().get(userId='me',id=mid).execute()
+                mime_type = msg_res['payload']['mimeType']
+                #print('msg_res: {0}'.format(msg_res))
+                #
+                #
+                # multipart/related
+                #
+                if mime_type == 'multipart/related':
+                    #print('found multipart/related')
+                    for part in msg_res['payload']['parts']:
+                        if 'attachmentId' in part['body']:
+                            #print('found attachment')
+                            if part['filename'].startswith('girlgen') or part['filename'].startswith('megatok'):
+                                unwanted = True
+                            else:
+                                atts[part['body']['attachmentId']] = part['filename']
+                                att_cnt += 1
+                elif mime_type == 'multipart/mixed':
+                    # msg_extra['payload']['parts'][0]['parts'][1]
+                    print('found multipart/mixed')
+                    for part0 in msg_res['payload']['parts']:
+                        if 'parts' in part0:
+                            for part1 in part0['parts']:
+                                if 'attachmentId' in part1['body']:
+                                    if part1['filename'].startswith('girlgen') or part1['filename'].startswith('megatok'):
+                                        unwanted = True
+                                    else:
+                                        #print('found attachment')
+                                        att_cnt += 1
+                                        atts[part1['body']['attachmentId']] = part1['filename']
+
+                else:
+                    print('unknown message type detected')
+
+                if len(atts) > 0 or unwanted:
+                    retval[mid] = atts
+                    #print('found {0} attachment(s)'.format(len(atts)))
+#                elif girl_genius:
+#                    retval[mid] = atts
+                else:
+                    print('mid={0}: detected no attachments, this should not happen'.format(mid))
+
+            print('found {0} attachment(s)'.format(att_cnt))
+            print('downloading...', end='')
+
+            return retval
+
+        from time import sleep
+        while req:
+            req_cnt += 1
+            req = self.__conn.users().messages().list(**parms)
+            res = req.execute()
+            sleep(0.5)
+            req = self.__conn.users().messages().list_next(previous_request=req,
+                                                           previous_response=res)
+            if req_cnt > 0:
+                req = None
+
+            msgs_list.extend(res['messages'])
+
+            #print(len(msgs_list))
+            #print(msgs_list)
+
+        return get_attachmentIds(msgs_list)
+
+class GmailShell(cmd.Cmd):
+    intro = '\nWelcome to GmailShell. Type "help" for help.\n'
+    prompt = 'Gmail> '
+    __conn = None
 
     #
     # overrides
@@ -83,14 +231,32 @@ class GMailShell(cmd.Cmd):
         pass
 
     def preloop(self):
-        pass
+        from os.path import expanduser
+        self.__conn = GmailConnection(expanduser('~/.gmailshell'))
 
     #
     # commands
     #
+    def do_list_attachments(self, line):
+        args = line.split(' ')
+        res = self.__conn.list_attachments(args[0])
+
+        for el in res:
+            print('file name: {0}, aId: {1}'.format(el['filename'], el['aId']))
+
+    def do_list_labels(self, line):
+        labels = sorted(self.__conn.list_labels(), key=lambda x: x.get('name', 'zz_no_name'))
+        for l in labels:
+            print('name: {0}, id: {1}'.format(l.get('name','zz_no_name'), l.get('id','no_id')))
+
+
+    def do_list_messages(self, line):
+        args = line.split(' ')
+        for m in self.__conn.list_messages(args[0]):
+            print(m)
+
     def do_debug(self, line):
         pass
-    
 
     def do_quit(self, line):
         return True
@@ -100,4 +266,4 @@ class GMailShell(cmd.Cmd):
 
 
 if __name__ == '__main__':
-    GMailShell().cmdloop()
+    GmailShell().cmdloop()
